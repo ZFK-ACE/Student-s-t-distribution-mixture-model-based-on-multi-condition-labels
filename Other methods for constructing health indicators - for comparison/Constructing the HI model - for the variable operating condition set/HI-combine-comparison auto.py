@@ -61,7 +61,7 @@ class TDistributionHealthIndicator:
 
     def __init__(self, n_components=3, covariance_type='full', nu=5.0,
                  random_state=42, use_pca=True, n_components_pca=None, variance_threshold=0.95,
-                 kalman_process_variance=1e-4, kalman_measurement_variance=0.1, scale_factor=25.0):
+                 kalman_process_variance=1e-4, kalman_measurement_variance=0.1, scale_factor=2.0):
         self.n_components = n_components
         self.covariance_type = covariance_type
         self.nu = nu
@@ -190,7 +190,7 @@ class TDistributionHealthIndicator:
 
         # Calculate HI
         log_likelihood_diff = self.healthy_log_likelihood_mean - log_likelihood
-        # 使用动态传入的 scale_factor 替换固定的数值
+        # 修改处：使用动态传入的 scale_factor 替换固定的 2.0
         scaled_diff = log_likelihood_diff / (self.scale_factor * self.healthy_log_likelihood_std)
         health_indicator = np.exp(-scaled_diff)
         health_indicator = np.clip(health_indicator, 0, 1)
@@ -202,34 +202,56 @@ class TDistributionHealthIndicator:
 # PART 2: Clustering Method and CLEANING UTILS
 # ======================================================================================
 
-def bic_based_clustering(data, n_components_range=range(1, 12), covariance_type='tied'):
+def bic_based_clustering(data, n_components_range=range(1, 12), covariance_type='diag', nu=5):
     """
-    BIC-based clustering (Low sensitivity mode)
+    BIC-based clustering using t-distribution mixture model (Robust mode)
+    K-value determination remains the same (BIC-based).
     """
     best_model = None
     best_bic = np.inf
     best_n = 0
     results = {}
 
-    print("\n正在使用BIC准则选择最优簇数量 (低敏感度模式)...")
+    print(f"\n正在使用BIC准则选择最优簇数量 (基于t分布混合模型, nu={nu})...")
 
     bic_values = []
+    n_features = data.shape[1]
 
     for n in n_components_range:
-        model = GaussianMixture(
+        # 使用贝叶斯高斯混合作为基模型（利用其EM算法框架估计参数）
+        # t分布聚类通过厚尾属性在评估聚类效果(BIC)时提供更强的鲁棒性
+        model = BayesianGaussianMixture(
             n_components=n,
             covariance_type=covariance_type,
+            weight_concentration_prior_type='dirichlet_process',
+            weight_concentration_prior=10,
             random_state=42,
             max_iter=300,
-            n_init=10,
-            reg_covar=0.3,
+            n_init=5,
             tol=1e-3
         )
         model.fit(data)
-        labels = model.predict(data)
-        bic = model.bic(data)
+
+        # 为了计算t分布下的BIC，我们需要重写对数似然计算
+        # 这里复用TDistributionHealthIndicator中的t-log-likelihood逻辑
+        temp_hi = TDistributionHealthIndicator(nu=nu, covariance_type=covariance_type, use_pca=False)
+        temp_hi.model = model
+
+        # 计算所有样本在t分布假设下的Log-Likelihood
+        t_log_probs = temp_hi._calculate_t_log_likelihood(data)
+        total_log_likelihood = np.sum(t_log_probs)
+
+        # 计算参数量以求BIC
+        # 参数量 p = 权重(n-1) + 均值(n*d) + 协方差(n*d if diag else n*d*(d+1)/2)
+        if covariance_type == 'diag':
+            p = (n - 1) + (n * n_features) + (n * n_features)
+        else:
+            p = (n - 1) + (n * n_features) + (n * n_features * (n_features + 1) / 2)
+        penalty_factor = 60
+        bic = -2 * total_log_likelihood + penalty_factor * p * np.log(data.shape[0])
         bic_values.append(bic)
 
+        labels = model.predict(data)
         results[n] = {
             'model': model,
             'labels': labels,
@@ -237,7 +259,7 @@ def bic_based_clustering(data, n_components_range=range(1, 12), covariance_type=
             'converged': model.converged_,
             'n_iter': model.n_iter_
         }
-        print(f"簇数={n:2d}, BIC={bic:.2f}")
+        print(f"簇数={n:2d}, t-BIC={bic:.2f}")
 
         if bic < best_bic:
             best_bic = bic
@@ -390,6 +412,137 @@ def split_and_featurize(data, chunk_size=20000):
 # ======================================================================================
 # PART 4: Visualization Functions
 # ======================================================================================
+
+def visualize_and_save_t_distributions(model, data_scaled, labels, output_dir, nu=5.0):
+    """
+    【新增】绘制并保存 T 分布混合模型聚类结果的等高线图及 1D 概率密度曲线，
+    同时将计算网格数据导出为 CSV 方便在 Origin 中复现。
+    """
+    dim = data_scaled.shape[1]
+    # 取前两个特征的范围作为 2D 可视化边界
+    x_min, x_max = data_scaled[:, 0].min() - 1, data_scaled[:, 0].max() + 1
+    y_min, y_max = data_scaled[:, 1].min() - 1, data_scaled[:, 1].max() + 1 if dim > 1 else (-1, 1)
+
+    # ---------------------------------------------------------
+    # 1. 生成用于绘制 2D 等高线的网格数据
+    # ---------------------------------------------------------
+    xx, yy = np.meshgrid(np.linspace(x_min, x_max, 100), np.linspace(y_min, y_max, 100))
+    grid_points = np.c_[xx.ravel(), yy.ravel()]
+
+    # 如果特征维度大于 2，在计算似然时将多余维度填充为全局均值（即 0）
+    if dim > 2:
+        padding = np.zeros((grid_points.shape[0], dim - 2))
+        grid_points_full = np.hstack([grid_points, padding])
+    else:
+        grid_points_full = grid_points
+
+    weights = model.weights_
+    means = model.means_
+    covariances = model.covariances_
+    covariance_type = model.covariance_type
+
+    def calc_t_pdf(X_pts, mean, cov, cov_type):
+        """计算给定点云在特定 t 分布簇下的概率密度 (PDF)"""
+        X_centered = X_pts - mean
+        if cov_type == 'full':
+            reg = 1e-6 * np.eye(cov.shape[0])
+            inv_cov = np.linalg.pinv(cov + reg)
+            _, logdet = np.linalg.slogdet(cov + reg)
+            mahalanobis = np.sum(X_centered @ inv_cov * X_centered, axis=1)
+            log_det_sigma = logdet
+        elif cov_type == 'diag':
+            mahalanobis = np.sum(X_centered ** 2 / (cov + 1e-6), axis=1)
+            log_det_sigma = np.sum(np.log(cov + 1e-6))
+        else:
+            mahalanobis = np.sum(X_centered ** 2, axis=1) / (cov + 1e-6)
+            log_det_sigma = dim * np.log(cov + 1e-6)
+
+        d = dim
+        log_const = (special.gammaln((nu + d) / 2) - special.gammaln(nu / 2) - (d / 2) * np.log(nu * np.pi))
+        log_prob = (log_const - 0.5 * log_det_sigma - ((nu + d) / 2) * np.log(1 + mahalanobis / nu))
+        return np.exp(log_prob)
+
+    cluster_pdfs_2d = {}
+    for k in range(len(weights)):
+        if weights[k] < 1e-6: continue
+        cluster_pdfs_2d[f'Cluster_{k}'] = calc_t_pdf(grid_points_full, means[k], covariances[k], covariance_type)
+
+    # 汇总并保存 2D 网格数据到 CSV
+    grid_df = pd.DataFrame({'Feature_1': grid_points[:, 0], 'Feature_2': grid_points[:, 1]})
+    total_pdf_2d = np.zeros_like(xx.ravel())
+    for k_name, pdf_vals in cluster_pdfs_2d.items():
+        grid_df[k_name + '_PDF'] = pdf_vals
+        k_idx = int(k_name.split('_')[1])
+        total_pdf_2d += weights[k_idx] * pdf_vals
+
+    grid_df['Total_Mixture_PDF'] = total_pdf_2d
+    csv_2d_path = os.path.join(output_dir, "Origin_T_Distribution_2D_Contours.csv")
+    grid_df.to_csv(csv_2d_path, index=False)
+
+    # ---------------------------------------------------------
+    # 2. 生成用于绘制 1D 截面（厚尾现象）的曲线数据
+    # ---------------------------------------------------------
+    x_1d = np.linspace(x_min, x_max, 500)
+    line_points = np.zeros((500, dim))
+    line_points[:, 0] = x_1d
+
+    df_1d = pd.DataFrame({'Feature_1_X': x_1d})
+    total_pdf_1d = np.zeros(500)
+    cluster_pdfs_1d = {}
+
+    for k in range(len(weights)):
+        if weights[k] < 1e-6: continue
+        pdf_1d = calc_t_pdf(line_points, means[k], covariances[k], covariance_type)
+        cluster_pdfs_1d[f'Cluster_{k}'] = pdf_1d
+        df_1d[f'Cluster_{k}_PDF'] = pdf_1d
+        total_pdf_1d += weights[k] * pdf_1d
+
+    df_1d['Total_Mixture_PDF'] = total_pdf_1d
+    csv_1d_path = os.path.join(output_dir, "Origin_T_Distribution_1D_Curves.csv")
+    df_1d.to_csv(csv_1d_path, index=False)
+
+    # ---------------------------------------------------------
+    # 3. 绘图 (Python 端可视化展示)
+    # ---------------------------------------------------------
+    fig = plt.figure(figsize=(16, 6))
+
+    # 子图 1: 2D 等高线图
+    ax1 = fig.add_subplot(1, 2, 1)
+    scatter = ax1.scatter(data_scaled[:, 0], data_scaled[:, 1], c=labels, cmap='tab20', s=10, alpha=0.5)
+    Z = total_pdf_2d.reshape(xx.shape)
+    contour = ax1.contour(xx, yy, Z, levels=15, cmap='viridis', alpha=0.8)
+    ax1.clabel(contour, inline=True, fontsize=8)
+
+    for k in range(len(weights)):
+        if weights[k] < 1e-6: continue
+        ax1.scatter(means[k][0], means[k][1], marker='X', s=100, color='red', edgecolor='k')
+        ax1.text(means[k][0], means[k][1], f' C{k}', color='red', fontsize=12, fontweight='bold')
+
+    ax1.set_title(f'T-Distribution 2D Mixture Contours (nu={nu})')
+    ax1.set_xlabel('Scaled Feature 1')
+    ax1.set_ylabel('Scaled Feature 2')
+    plt.colorbar(scatter, ax=ax1, label='Cluster Label')
+
+    # 子图 2: 1D 概率密度曲线图
+    ax2 = fig.add_subplot(1, 2, 2)
+    for k_name, pdf_vals in cluster_pdfs_1d.items():
+        k_idx = int(k_name.split('_')[1])
+        ax2.plot(x_1d, weights[k_idx] * pdf_vals, label=f'{k_name} (Weighted)', linewidth=2)
+    ax2.plot(x_1d, total_pdf_1d, label='Total Mixture', color='black', linestyle='--', linewidth=2)
+
+    ax2.set_title(f'T-Distribution 1D Probability Density Curves (nu={nu})')
+    ax2.set_xlabel('Scaled Feature 1')
+    ax2.set_ylabel('Probability Density')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    img_path = os.path.join(output_dir, "T_Distribution_Clusters_Visualization.png")
+    plt.savefig(img_path, dpi=300)
+    plt.show()
+    print(f"\n[Info] T-distribution data saved to:\n - {csv_2d_path}\n - {csv_1d_path}")
+    print(f"[Info] T-distribution visualization image saved to:\n - {img_path}\n")
+
 
 def visualize_clustering(original_rms_data, labels, pca_obj, pca_data):
     """
@@ -568,15 +721,24 @@ def visualize_final_fusion(hi_kalman, hi_cumulative, hi_fused, fusion_confidence
 # PART 5: Fusion Logic
 # ======================================================================================
 
-def build_cumulative_anomaly_health_indicator(anomaly_flags, health_indicator_kalman=None):
-    n_samples = len(anomaly_flags)
+def build_cumulative_anomaly_health_indicator(anomaly_flags, f_max_abs, health_indicator_kalman=None):
+    """
+    修改后的函数：使用 1 - log_0.1(exp^(-累计异常数/(1.5*f_max_abs))) 公式
+    """
     cumulative_anomalies = np.cumsum(anomaly_flags)
-    max_cumulative = np.max(cumulative_anomalies)
-    if max_cumulative > 0:
-        health_indicator_cumulative = 1 - (cumulative_anomalies / max_cumulative)
-    else:
-        health_indicator_cumulative = np.ones(n_samples)
-    return health_indicator_cumulative
+
+    # 防止除零错误
+    denominator = 1.5 * f_max_abs if f_max_abs > 0 else 1.0
+
+    # 1. 计算内部的 exp 项
+    exp_term = np.exp(-cumulative_anomalies / denominator)
+
+    # 2. 利用换底公式计算以 0.1 为底的对数
+    log_term = np.log(exp_term) / np.log(0.1)
+
+    # 3. 计算最终的累计 HI，并限制在 0-1 之间
+    hi_cumulative = 1.0 - log_term
+    return np.clip(hi_cumulative, 0.0, 1.0)
 
 
 def decision_level_fusion_optimized(hi_kalman, hi_cumulative,
@@ -717,11 +879,13 @@ def main():
         }
         df = pd.DataFrame(data)
 
-    # --- 新增：在特征提取前，从原始数据前 2,000,0 个样本中计算全局 scale_factor ---
+    # --- 新增：在特征提取前，从原始数据前 2,000,000 个样本中计算全局 scale_factor ---
     force_cols_raw = [c for c in ['F_x', 'F_y', 'F_z'] if c in df.columns]
-    global_scale_factor = 25.0  # 默认值
+    global_scale_factor = 2.0  # 默认值
+    f_max_abs = 300.0  # <--- 新增默认值，以防计算公式时报错
+
     if force_cols_raw:
-        f_max_abs = np.max(np.abs(df[force_cols_raw].iloc[:20000].values))
+        f_max_abs = np.max(np.abs(df[force_cols_raw].iloc[:200000].values))
         print(f"f_max_abs = {f_max_abs}")
         if f_max_abs > 0:
             global_scale_factor = 300 / f_max_abs
@@ -734,11 +898,12 @@ def main():
         print("Not enough data samples.")
         return
 
-    # 3. Clustering
+    # 3. Clustering (MODIFIED: Gaussian -> t-Distribution)
     scaler_cluster = StandardScaler()
     cluster_data_scaled = scaler_cluster.fit_transform(df_cluster_feats)
 
-    model_cluster, best_n, results, bic_vals = bic_based_clustering(cluster_data_scaled)
+    # 替换了此处的调用，添加 nu=5.0 参数
+    model_cluster, best_n, results, bic_vals = bic_based_clustering(cluster_data_scaled, nu=5.0)
     labels_raw = model_cluster.predict(cluster_data_scaled)
 
     # ==============================================================================
@@ -748,6 +913,10 @@ def main():
     noise_threshold = 50
     labels = filter_short_segments(labels_raw, min_segment_length=noise_threshold)
     # ==============================================================================
+
+    # 【核心新增调用】生成 T 分布聚类效果的图片与网格数据 CSV
+    print("\nGenerating T-Distribution Visualizations and Data...")
+    visualize_and_save_t_distributions(model_cluster, cluster_data_scaled, labels, final_output_dir, nu=5.0)
 
     # PCA for visualization
     n_cluster_feats = cluster_data_scaled.shape[1]
@@ -788,7 +957,8 @@ def main():
         elif current_count == n_construct_samples:
             baseline_data = np.array(cluster_history[current_label])
             # 修改处：实例化时将全局计算的 scale_factor 传入
-            model = TDistributionHealthIndicator(n_components=min(3, len(baseline_data)), covariance_type='diag', scale_factor=global_scale_factor)
+            model = TDistributionHealthIndicator(n_components=min(3, len(baseline_data)), covariance_type='diag',
+                                                 scale_factor=global_scale_factor)
             try:
                 model.fit(baseline_data)
                 hi_models[current_label] = model
@@ -852,7 +1022,8 @@ def main():
     visualize_hi(final_hi_filtered, log_likelihood_array, labels)
 
     # 5. Fusion
-    hi_cumulative_arr = build_cumulative_anomaly_health_indicator(anomaly_flags, final_hi_filtered)
+    # 【修改处】: 传入 f_max_abs 供新公式计算
+    hi_cumulative_arr = build_cumulative_anomaly_health_indicator(anomaly_flags, f_max_abs, final_hi_filtered)
 
     hi_fused_list, conf_list, w_k_list, w_c_list = [], [], [], []
     for k in range(len(final_hi_filtered)):
@@ -887,6 +1058,7 @@ def main():
         'Threshold': thresholds_array,
         'Cumulative_HI': hi_cumulative_arr,
         'Anomaly_Flag': anomaly_flags.astype(int),
+        'Cumulative_Anomaly_Count': np.cumsum(anomaly_flags),  # <--- 新增列保存累计异常数
         'Fused_HI_Raw': hi_fused_arr,
         'Fused_HI_Median_Filtered': hi_fused_filtered,
         'Fusion_Confidence': conf_list,
