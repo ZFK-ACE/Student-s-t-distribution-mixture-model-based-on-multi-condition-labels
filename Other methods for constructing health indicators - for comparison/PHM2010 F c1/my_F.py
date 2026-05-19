@@ -51,7 +51,7 @@ class KalmanFilter1D:
 class TDistributionHealthIndicator:
     def __init__(self, n_components=3, covariance_type='full', nu=5.0,
                  random_state=42, use_pca=True, n_components_pca=None, variance_threshold=0.95,
-                 kalman_process_variance=1e-4, kalman_measurement_variance=0.1):
+                 kalman_process_variance=1e-4, kalman_measurement_variance=0.1, scale_factor=25):
         self.n_components = n_components
         self.covariance_type = covariance_type
         self.nu = nu
@@ -65,6 +65,7 @@ class TDistributionHealthIndicator:
         self.healthy_log_likelihood_mean = None
         self.healthy_log_likelihood_std = None
         self.healthy_log_likelihood_threshold = None
+        self.scale_factor = scale_factor  # 新增属性：接收外部传入的 scale_factor
 
     def fit(self, X_healthy):
         if isinstance(X_healthy, pd.DataFrame):
@@ -149,7 +150,8 @@ class TDistributionHealthIndicator:
             x_scaled = self.pca.transform(x_scaled)
         log_likelihood = self._calculate_t_log_likelihood(x_scaled)[0]
         log_likelihood_diff = self.healthy_log_likelihood_mean - log_likelihood
-        scaled_diff = log_likelihood_diff / (25 * self.healthy_log_likelihood_std)
+        # 使用动态传入的 scale_factor 替换固定的 25
+        scaled_diff = log_likelihood_diff / (self.scale_factor * self.healthy_log_likelihood_std)
         health_indicator = np.exp(-scaled_diff)
         return np.clip(health_indicator, 0, 1), log_likelihood
 
@@ -264,7 +266,7 @@ def split_and_featurize(data, chunk_size=20000):
 
 
 # ======================================================================================
-# PART 4: 可视化与融合逻辑 (保持不变)
+# PART 4: 可视化与融合逻辑
 # ======================================================================================
 
 def visualize_clustering(original_rms_data, labels, pca_obj, pca_data):
@@ -332,7 +334,6 @@ def visualize_final_fusion(hi_kalman, hi_cumulative, hi_fused, conf):
     plt.show()
 
 
-# --- 新增的可视化函数 ---
 def visualize_final_hi_standalone(hi_fused):
     """
     单独展示融合后的最终健康指标
@@ -351,10 +352,24 @@ def visualize_final_hi_standalone(hi_fused):
     plt.show()
 
 
-def build_cumulative_anomaly_health_indicator(anomaly_flags):
+def build_cumulative_anomaly_health_indicator(anomaly_flags, f_max_abs):
+    """
+    【修改处】: 使用 1 - log_0.1(exp^(-累计异常数/(1.5*f_max_abs))) 公式
+    """
     cum_anomalies = np.cumsum(anomaly_flags)
-    max_cum = np.max(cum_anomalies)
-    return 1 - (cum_anomalies / max_cum) if max_cum > 0 else np.ones(len(anomaly_flags))
+
+    # 防止除零错误
+    denominator =55 * f_max_abs if f_max_abs > 0 else 1.0
+
+    # 1. 计算内部的 exp 项
+    exp_term = np.exp(-cum_anomalies / denominator)
+
+    # 2. 利用换底公式计算以 0.1 为底的对数
+    log_term = np.log(exp_term) / np.log(0.1)
+
+    # 3. 计算最终的累计 HI，并限制在 0-1 之间
+    hi_cumulative = 1.0 - log_term
+    return np.clip(hi_cumulative, 0.0, 1.0)
 
 
 def decision_level_fusion_optimized(hi_k, hi_c):
@@ -372,6 +387,18 @@ def main():
     data_path = r"E:\铣刀数据\2023_7_铣刀\训练数据"
     df = load_combined_data(data_path)
     if df is None: return
+
+    # --- 新增：在特征提取前，从原始数据前 2,000,000 个样本中计算全局 scale_factor ---
+    force_cols_raw = [c for c in ['F_x', 'F_y', 'F_z'] if c in df.columns]
+    global_scale_factor = 25  # 默认值
+    f_max_abs = 300.0  # 【修改处】: 设置 f_max_abs 的基础默认值，以防在计算公式时报错
+
+    if force_cols_raw:
+        f_max_abs = np.max(np.abs(df[force_cols_raw].iloc[:100000].values))
+        print(f"f_max_abs = {f_max_abs}")
+        if f_max_abs > 0:
+            global_scale_factor = 300 / f_max_abs
+    # -------------------------------------------------------------------------
 
     # --- 为了获取 source_file_path 用于保存文件夹命名 (不修改 load 函数返回值) ---
     if os.path.isdir(data_path):
@@ -409,7 +436,7 @@ def main():
     labels = filter_short_segments(model.predict(scaled_data))
 
     pca = PCA(n_components=2)
-    pca_data = pca.fit_transform(scaled_data) # 提取变量以便保存
+    pca_data = pca.fit_transform(scaled_data)  # 提取变量以便保存
     visualize_clustering(df_cluster_feats, labels, pca, pca_data)
 
     # HI 构建
@@ -421,11 +448,13 @@ def main():
         label = labels[i]
         feat = df_hi_feats.iloc[i].values
         if label not in hi_models:
-            m = TDistributionHealthIndicator().fit(df_hi_feats[labels == label].iloc[:100])
+            # 修改处：实例化时将全局计算的 scale_factor 传入
+            m = TDistributionHealthIndicator(scale_factor=global_scale_factor).fit(
+                df_hi_feats[labels == label].iloc[:100])
             hi_models[label] = m
         hi, ll = hi_models[label].calculate_single_sample_hi(feat)
         hi_array[i], ll_array[i] = hi, ll
-        thresholds[i] = hi_models[label].healthy_log_likelihood_threshold # 更新阈值以便保存
+        thresholds[i] = hi_models[label].healthy_log_likelihood_threshold  # 更新阈值以便保存
 
     kf = KalmanFilter1D(initial_value=1.0)
     hi_filtered = kf.filter_sequence(hi_array)
@@ -436,9 +465,10 @@ def main():
 
     # 融合
     anomalies = hi_filtered < 0.6
-    hi_cum = build_cumulative_anomaly_health_indicator(anomalies)
+    # 【修改处】: 调用函数时传入 f_max_abs 参数
+    hi_cum = build_cumulative_anomaly_health_indicator(anomalies, f_max_abs)
     fused_results = [decision_level_fusion_optimized(hi_filtered[k], hi_cum[k]) for k in range(n_total)]
-    hi_fused = np.array([r[0] for r in fused_results]) # 转为numpy数组
+    hi_fused = np.array([r[0] for r in fused_results])  # 转为numpy数组
     conf = [r[1] for r in fused_results]
 
     # 为了匹配保存格式，计算中值滤波后的HI
@@ -461,12 +491,13 @@ def main():
     origin_hi_df = pd.DataFrame({
         'Sample_Index': range(n_total),
         'Raw_HI': hi_array,
-        'Stitched_HI': hi_array, # 本代码无拼接逻辑，用 Raw_HI 替代
+        'Stitched_HI': hi_array,  # 本代码无拼接逻辑，用 Raw_HI 替代
         'Kalman_Filtered_HI': hi_filtered,
         'Log_Likelihood': ll_array,
         'Threshold': thresholds,
         'Cumulative_HI': hi_cum,
         'Anomaly_Flag': anomalies.astype(int),
+        'Cumulative_Anomaly_Count': np.cumsum(anomalies),  # 新增：保存累计异常数
         'Fused_HI_Raw': hi_fused,
         'Fused_HI_Median_Filtered': hi_fused_filtered,
         'Fusion_Confidence': conf,
