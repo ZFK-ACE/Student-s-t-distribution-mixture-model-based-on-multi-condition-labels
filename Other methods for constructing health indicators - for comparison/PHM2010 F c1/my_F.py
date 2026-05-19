@@ -353,9 +353,7 @@ def visualize_final_hi_standalone(hi_fused):
 
 
 def build_cumulative_anomaly_health_indicator(anomaly_flags, f_max_abs):
-    """
-    【修改处】: 使用 1 - log_0.1(exp^(-累计异常数/(1.5*f_max_abs))) 公式
-    """
+ 
     cum_anomalies = np.cumsum(anomaly_flags)
 
     # 防止除零错误
