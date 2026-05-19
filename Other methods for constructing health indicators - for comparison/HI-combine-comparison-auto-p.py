@@ -721,15 +721,24 @@ def visualize_final_fusion(hi_kalman, hi_cumulative, hi_fused, fusion_confidence
 # PART 5: Fusion Logic
 # ======================================================================================
 
-def build_cumulative_anomaly_health_indicator(anomaly_flags, health_indicator_kalman=None):
-    n_samples = len(anomaly_flags)
+def build_cumulative_anomaly_health_indicator(anomaly_flags, f_max_abs, health_indicator_kalman=None):
+    """
+    修改后的函数：使用 1 - log_0.1(exp^(-累计异常数/(1.5*f_max_abs))) 公式
+    """
     cumulative_anomalies = np.cumsum(anomaly_flags)
-    max_cumulative = np.max(cumulative_anomalies)
-    if max_cumulative > 0:
-        health_indicator_cumulative = 1 - (cumulative_anomalies / max_cumulative)
-    else:
-        health_indicator_cumulative = np.ones(n_samples)
-    return health_indicator_cumulative
+
+    # 防止除零错误
+    denominator = 1.5 * f_max_abs if f_max_abs > 0 else 1.0
+
+    # 1. 计算内部的 exp 项
+    exp_term = np.exp(-cumulative_anomalies / denominator)
+
+    # 2. 利用换底公式计算以 0.1 为底的对数
+    log_term = np.log(exp_term) / np.log(0.1)
+
+    # 3. 计算最终的累计 HI，并限制在 0-1 之间
+    hi_cumulative = 1.0 - log_term
+    return np.clip(hi_cumulative, 0.0, 1.0)
 
 
 def decision_level_fusion_optimized(hi_kalman, hi_cumulative,
@@ -873,6 +882,8 @@ def main():
     # --- 新增：在特征提取前，从原始数据前 2,000,000 个样本中计算全局 scale_factor ---
     force_cols_raw = [c for c in ['F_x', 'F_y', 'F_z'] if c in df.columns]
     global_scale_factor = 2.0  # 默认值
+    f_max_abs = 300.0  # <--- 新增默认值，以防计算公式时报错
+
     if force_cols_raw:
         f_max_abs = np.max(np.abs(df[force_cols_raw].iloc[:200000].values))
         print(f"f_max_abs = {f_max_abs}")
@@ -1011,7 +1022,8 @@ def main():
     visualize_hi(final_hi_filtered, log_likelihood_array, labels)
 
     # 5. Fusion
-    hi_cumulative_arr = build_cumulative_anomaly_health_indicator(anomaly_flags, final_hi_filtered)
+    # 【修改处】: 传入 f_max_abs 供新公式计算
+    hi_cumulative_arr = build_cumulative_anomaly_health_indicator(anomaly_flags, f_max_abs, final_hi_filtered)
 
     hi_fused_list, conf_list, w_k_list, w_c_list = [], [], [], []
     for k in range(len(final_hi_filtered)):
@@ -1046,6 +1058,7 @@ def main():
         'Threshold': thresholds_array,
         'Cumulative_HI': hi_cumulative_arr,
         'Anomaly_Flag': anomaly_flags.astype(int),
+        'Cumulative_Anomaly_Count': np.cumsum(anomaly_flags),  # <--- 新增列保存累计异常数
         'Fused_HI_Raw': hi_fused_arr,
         'Fused_HI_Median_Filtered': hi_fused_filtered,
         'Fusion_Confidence': conf_list,
