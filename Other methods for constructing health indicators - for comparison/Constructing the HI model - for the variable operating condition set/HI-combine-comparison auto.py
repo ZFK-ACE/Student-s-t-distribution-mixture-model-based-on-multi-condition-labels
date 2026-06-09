@@ -416,7 +416,6 @@ def split_and_featurize(data, chunk_size=20000):
 def visualize_and_save_t_distributions(model, data_scaled, labels, output_dir, nu=5.0):
     """
     【新增】绘制并保存 T 分布混合模型聚类结果的等高线图及 1D 概率密度曲线，
-    同时将计算网格数据导出为 CSV 方便在 Origin 中复现。
     """
     dim = data_scaled.shape[1]
     # 取前两个特征的范围作为 2D 可视化边界
@@ -736,7 +735,7 @@ def build_cumulative_anomaly_health_indicator(anomaly_flags, f_max_abs, health_i
     # 2. 利用换底公式计算以 0.1 为底的对数
     log_term = np.log(exp_term) / np.log(0.1)
 
-    # 3. 计算最终的累计 HI，并限制在 0-1 之间
+    # 3. 计算最终的累计 HI
     hi_cumulative = 1.0 - log_term
     return np.clip(hi_cumulative, 0.0, 1.0)
 
@@ -1069,9 +1068,7 @@ def main():
     origin_hi_df.to_csv(os.path.join(final_output_dir, "Origin_HI_Fusion_Results.csv"), index=False)
 
     print("Origin CSV files saved successfully.")
-    # ==========================================================
 
-    # 保持原有的所有可视化输出
     visualize_original_hi_separate(final_hi_filtered)
     visualize_hi_with_cluster_boundaries(final_hi_filtered, labels)
     visualize_cumulative_hi_only(hi_cumulative_arr, anomaly_flags)
