@@ -5,4 +5,4 @@ Baidu Netdisk link: https://pan.baidu.com/s/1viyUPUFjoc8EOpGU3p8xAA?pwd=6666 pas
 The MCt.py file is the code for the proposed method.
 Its MCt-PHM2010.py file contains the code for the proposed method in the PHM2010 public dataset.
 
-The Video Attachment 1.mp4py file presents the performance of the proposed method in the actual experiment in the form of a video.
+The Video Attachment 1.mp4 file presents the performance of the proposed method in the actual experiment in the form of a video.
