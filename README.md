@@ -5,4 +5,4 @@ The experimental data provide the data for the variable-condition G6 operation m
 #
 The code for the MCt part is located at:
 1. Multi-cutting condition dataset: Other methods for constructing health indicators - for comparison / Constructing the HI model - for the variable operating condition set / HI-combine-comparison auto.py
-2. Dataset of 2010:Other methods for constructing health indicators - for comparison/PHM2010 F c1/my_F_auto.py
+2. Dataset of 2010:Other methods for constructing health indicators - for comparison/PHM2010 F c1/my_F.py
