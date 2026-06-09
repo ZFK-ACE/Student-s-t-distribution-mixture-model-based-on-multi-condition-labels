@@ -59,9 +59,9 @@ class TDistributionHealthIndicator:
     Health Indicator Builder based on t-distribution mixture model (from Construction... file)
     """
 
-    def __init__(self, n_components=3, covariance_type='full', nu=5,
+    def __init__(self, n_components=3, covariance_type='full', nu=5.0,
                  random_state=42, use_pca=True, n_components_pca=None, variance_threshold=0.95,
-                 kalman_process_variance=1e-4, kalman_measurement_variance=0.1):
+                 kalman_process_variance=1e-4, kalman_measurement_variance=0.1, scale_factor=25.0):
         self.n_components = n_components
         self.covariance_type = covariance_type
         self.nu = nu
@@ -79,6 +79,7 @@ class TDistributionHealthIndicator:
         self.healthy_log_likelihood_std = None
         self.healthy_log_likelihood_threshold = None
         self.kalman_filter = None
+        self.scale_factor = scale_factor  # 新增属性：接收外部传入的 scale_factor
 
     def fit(self, X_healthy):
         # Standardize
@@ -189,7 +190,8 @@ class TDistributionHealthIndicator:
 
         # Calculate HI
         log_likelihood_diff = self.healthy_log_likelihood_mean - log_likelihood
-        scaled_diff = log_likelihood_diff / (2.0 * self.healthy_log_likelihood_std)
+        # 使用动态传入的 scale_factor 替换固定的数值
+        scaled_diff = log_likelihood_diff / (self.scale_factor * self.healthy_log_likelihood_std)
         health_indicator = np.exp(-scaled_diff)
         health_indicator = np.clip(health_indicator, 0, 1)
 
@@ -197,59 +199,37 @@ class TDistributionHealthIndicator:
 
 
 # ======================================================================================
-# PART 2: Clustering Method (MODIFIED TO t-DISTRIBUTION MIXTURE) and CLEANING UTILS
+# PART 2: Clustering Method and CLEANING UTILS
 # ======================================================================================
 
-def bic_based_clustering(data, n_components_range=range(1, 12), covariance_type='diag', nu=5):
+def bic_based_clustering(data, n_components_range=range(1, 12), covariance_type='tied'):
     """
-    BIC-based clustering using t-distribution mixture model (Robust mode)
-    K-value determination remains the same (BIC-based).
+    BIC-based clustering (Low sensitivity mode)
     """
     best_model = None
     best_bic = np.inf
     best_n = 0
     results = {}
 
-    print(f"\n正在使用BIC准则选择最优簇数量 (基于t分布混合模型, nu={nu})...")
+    print("\n正在使用BIC准则选择最优簇数量 (低敏感度模式)...")
 
     bic_values = []
-    n_features = data.shape[1]
 
     for n in n_components_range:
-        # 使用贝叶斯高斯混合作为基模型（利用其EM算法框架估计参数）
-        # t分布聚类通过厚尾属性在评估聚类效果(BIC)时提供更强的鲁棒性
-        model = BayesianGaussianMixture(
+        model = GaussianMixture(
             n_components=n,
             covariance_type=covariance_type,
-            weight_concentration_prior_type='dirichlet_process',
-            weight_concentration_prior=10,
             random_state=42,
             max_iter=300,
-            n_init=5,
+            n_init=10,
+            reg_covar=0.3,
             tol=1e-3
         )
         model.fit(data)
-
-        # 为了计算t分布下的BIC，我们需要重写对数似然计算
-        # 这里复用TDistributionHealthIndicator中的t-log-likelihood逻辑
-        temp_hi = TDistributionHealthIndicator(nu=nu, covariance_type=covariance_type, use_pca=False)
-        temp_hi.model = model
-
-        # 计算所有样本在t分布假设下的Log-Likelihood
-        t_log_probs = temp_hi._calculate_t_log_likelihood(data)
-        total_log_likelihood = np.sum(t_log_probs)
-
-        # 计算参数量以求BIC
-        # 参数量 p = 权重(n-1) + 均值(n*d) + 协方差(n*d if diag else n*d*(d+1)/2)
-        if covariance_type == 'diag':
-            p = (n - 1) + (n * n_features) + (n * n_features)
-        else:
-            p = (n - 1) + (n * n_features) + (n * n_features * (n_features + 1) / 2)
-        penalty_factor = 60
-        bic = -2 * total_log_likelihood + penalty_factor* p * np.log(data.shape[0])
+        labels = model.predict(data)
+        bic = model.bic(data)
         bic_values.append(bic)
 
-        labels = model.predict(data)
         results[n] = {
             'model': model,
             'labels': labels,
@@ -257,7 +237,7 @@ def bic_based_clustering(data, n_components_range=range(1, 12), covariance_type=
             'converged': model.converged_,
             'n_iter': model.n_iter_
         }
-        print(f"簇数={n:2d}, t-BIC={bic:.2f}")
+        print(f"簇数={n:2d}, BIC={bic:.2f}")
 
         if bic < best_bic:
             best_bic = bic
@@ -331,7 +311,7 @@ def load_combined_data(file_path):
             found_files.extend(glob.glob(os.path.join(file_path, ext)))
         if not found_files:
             print("Error: No data files found.")
-            return None
+            return None, None
         target_file = sorted(found_files, key=os.path.getsize, reverse=True)[0]
     else:
         target_file = file_path
@@ -351,7 +331,7 @@ def load_combined_data(file_path):
             df = pd.read_csv(target_file, delimiter='\t')
     except Exception as e:
         print(f"Error loading file: {e}")
-        return None
+        return None, None
 
     # Column Mapping
     col_map = {}
@@ -369,16 +349,16 @@ def load_combined_data(file_path):
 
     if not found_cluster_cols:
         print("Error: No Current columns (Cur_u, v, w) found. Cannot perform clustering.")
-        return None
+        return None, None
     if not found_hi_cols:
         print("Error: No Force columns (F_x, y, z) found. Cannot calculate HI.")
-        return None
+        return None, None
 
     df_renamed = df.rename(columns=col_map)
     final_cols = found_cluster_cols + found_hi_cols
     print(f"Data Loaded. Found Channels -> Clustering: {found_cluster_cols}, HI: {found_hi_cols}")
 
-    return df_renamed[final_cols]
+    return df_renamed[final_cols], target_file
 
 
 def split_and_featurize(data, chunk_size=20000):
@@ -588,14 +568,27 @@ def visualize_final_fusion(hi_kalman, hi_cumulative, hi_fused, fusion_confidence
 # PART 5: Fusion Logic
 # ======================================================================================
 
-def build_cumulative_anomaly_health_indicator(anomaly_flags, health_indicator_kalman=None):
-    n_samples = len(anomaly_flags)
+def build_cumulative_anomaly_health_indicator(anomaly_flags, f_max_abs, health_indicator_kalman=None):
+    """
+    修改后的函数：传入 f_max_abs，使用 1 - log_0.1(exp^(-累计异常数/(1.5*f_max_abs))) 公式
+    """
     cumulative_anomalies = np.cumsum(anomaly_flags)
-    max_cumulative = np.max(cumulative_anomalies)
-    if max_cumulative > 0:
-        health_indicator_cumulative = 1 - (cumulative_anomalies / max_cumulative)
-    else:
-        health_indicator_cumulative = np.ones(n_samples)
+
+    # 计算分母 1.5 * f_max_abs (安全检查防止除零)
+    denominator = 1.5 * f_max_abs if f_max_abs > 0 else 1.0
+
+    # 1. 计算内部的 exp 项: exp^(-累计异常数 / denominator)
+    exp_term = np.exp(-cumulative_anomalies / denominator)
+
+    # 2. 利用换底公式计算以 0.1 为底的对数：log_0.1(x) = np.log(x) / np.log(0.1)
+    log_term = np.log(exp_term) / np.log(0.1)
+
+    # 3. 计算最终的累计健康指标 (HI)
+    health_indicator_cumulative = 1.0 - log_term
+
+    # 为了防止 HI 出现负数或超过 1 的异常情况，将其严格限制在 [0, 1] 范围内
+    health_indicator_cumulative = np.clip(health_indicator_cumulative, 0.0, 1.0)
+
     return health_indicator_cumulative
 
 
@@ -700,12 +693,26 @@ def decision_level_fusion_optimized(hi_kalman, hi_cumulative,
 
 def main():
     print("=" * 60)
-    print("Integrated HI Construction System (With t-Distribution Clustering)")
+    print("Integrated HI Construction System (With Noise Filtering)")
     print("=" * 60)
 
     # 1. Read Data
     data_path = r"E:\铣刀数据\2023_7_铣刀\训练数据"
-    df = load_combined_data(data_path)
+    df, source_file_path = load_combined_data(data_path)
+
+    # ==========================================================
+    # 【新增：保存路径处理】
+    # ==========================================================
+    base_save_path = r"E:\铣刀数据\2023_7_铣刀\comparison of models\构建的HI\MY—HI"
+    if source_file_path:
+        file_name = os.path.basename(source_file_path).split('.')[0]
+        final_output_dir = os.path.join(base_save_path, file_name)
+        if not os.path.exists(final_output_dir):
+            os.makedirs(final_output_dir)
+            print(f"Created directory: {final_output_dir}")
+    else:
+        final_output_dir = base_save_path
+    # ==========================================================
 
     if df is None:
         print("Creating Mock Data for Demonstration...")
@@ -723,6 +730,18 @@ def main():
         }
         df = pd.DataFrame(data)
 
+    # --- 新增：在特征提取前，从原始数据前 2,000,0 个样本中计算全局 scale_factor ---
+    force_cols_raw = [c for c in ['F_x', 'F_y', 'F_z'] if c in df.columns]
+    global_scale_factor = 25.0  # 默认值
+    f_max_abs = 300.0  # 为保证后面传入公式不出错，设置一个基础默认值
+
+    if force_cols_raw:
+        f_max_abs = np.max(np.abs(df[force_cols_raw].iloc[:20000].values))
+        print(f"f_max_abs = {f_max_abs}")
+        if f_max_abs > 0:
+            global_scale_factor = 300 / f_max_abs
+    # -------------------------------------------------------------------------
+
     # 2. Split and Featurize
     df_cluster_feats, df_hi_feats = split_and_featurize(df, chunk_size=20000)
 
@@ -730,12 +749,11 @@ def main():
         print("Not enough data samples.")
         return
 
-    # 3. Clustering (MODIFIED: Gaussian -> t-Distribution)
+    # 3. Clustering
     scaler_cluster = StandardScaler()
     cluster_data_scaled = scaler_cluster.fit_transform(df_cluster_feats)
 
-    # K值确定方法不变，但在计算BIC时使用t分布逻辑
-    model_cluster, best_n, results, bic_vals = bic_based_clustering(cluster_data_scaled, nu=5.0)
+    model_cluster, best_n, results, bic_vals = bic_based_clustering(cluster_data_scaled)
     labels_raw = model_cluster.predict(cluster_data_scaled)
 
     # ==============================================================================
@@ -761,6 +779,7 @@ def main():
     cluster_history = {l: [] for l in np.unique(labels)}
     cluster_indices = {l: [] for l in np.unique(labels)}
     cluster_offsets = {}
+
     global_kf = KalmanFilter1D(initial_value=1.0, process_variance=1e-4, measurement_variance=0.1)
     n_construct_samples = 100
 
@@ -783,7 +802,9 @@ def main():
             continue
         elif current_count == n_construct_samples:
             baseline_data = np.array(cluster_history[current_label])
-            model = TDistributionHealthIndicator(n_components=min(3, len(baseline_data)), covariance_type='diag')
+            # 修改处：实例化时将全局计算的 scale_factor 传入
+            model = TDistributionHealthIndicator(n_components=min(3, len(baseline_data)), covariance_type='diag',
+                                                 scale_factor=global_scale_factor)
             try:
                 model.fit(baseline_data)
                 hi_models[current_label] = model
@@ -818,18 +839,12 @@ def main():
                     stitched_val = rh - current_offset
                     final_hi_stitched_array[hist_idx] = np.clip(stitched_val, 0.0, 1.0)
             except Exception as e:
-                print(f"Error fitting model for Cluster {current_label}: {e}")
-                stored_indices = cluster_indices[current_label]
-                raw_hi_array[stored_indices] = 1.0
-                final_hi_stitched_array[stored_indices] = 1.0
+                print(f"Error fitting model: {e}")
         else:
             if current_label in hi_models:
                 if i > 0 and labels[i] != labels[i - 1]:
                     if current_label in cluster_offsets:
                         current_offset = cluster_offsets[current_label]
-                    else:
-                        current_offset = 0.0
-
                 rh, ll = hi_models[current_label].calculate_single_sample_hi(current_force)
                 raw_hi_array[i] = rh
                 log_likelihood_array[i] = ll
@@ -839,14 +854,8 @@ def main():
             else:
                 raw_hi_array[i] = 1.0
                 final_hi_stitched_array[i] = 1.0
-                log_likelihood_array[i] = -100
 
-    nan_mask = np.isnan(final_hi_stitched_array)
-    if np.any(nan_mask):
-        final_hi_stitched_array[nan_mask] = 1.0
-        log_likelihood_array[nan_mask] = 0.0
-
-    print("Applying Global Kalman Filter...")
+    final_hi_stitched_array[np.isnan(final_hi_stitched_array)] = 1.0
     final_hi_filtered = global_kf.filter_sequence(final_hi_stitched_array)
 
     anomaly_flags = []
@@ -856,65 +865,63 @@ def main():
         anomaly_flags.append(is_anomaly)
     anomaly_flags = np.array(anomaly_flags)
 
-    print("Generating HI Visualizations...")
     visualize_hi(final_hi_filtered, log_likelihood_array, labels)
-    visualize_original_hi_separate(final_hi_filtered)
-    visualize_hi_with_cluster_boundaries(final_hi_filtered, labels)
 
     # 5. Fusion
-    print("\nSTARTING HI FUSION PROCESS")
-    hi_cumulative_arr = build_cumulative_anomaly_health_indicator(anomaly_flags, final_hi_filtered)
-    visualize_cumulative_hi_only(hi_cumulative_arr, anomaly_flags)
+    # 这里将 f_max_abs 作为参数传入了函数
+    hi_cumulative_arr = build_cumulative_anomaly_health_indicator(anomaly_flags, f_max_abs, final_hi_filtered)
 
-    print("Performing Fusion...")
-    hi_fused_list = []
-    fusion_confidences_raw_list = []
-    weight_kalman_list = []
-    weight_cumulative_list = []
-
+    hi_fused_list, conf_list, w_k_list, w_c_list = [], [], [], []
     for k in range(len(final_hi_filtered)):
-        hi_k = final_hi_filtered[k]
-        hi_c = hi_cumulative_arr[k]
-        hi_f, _, conf, w_k, w_c = decision_level_fusion_optimized(hi_k, hi_c)
+        hi_f, _, conf, w_k, w_c = decision_level_fusion_optimized(final_hi_filtered[k], hi_cumulative_arr[k])
         hi_fused_list.append(hi_f)
-        fusion_confidences_raw_list.append(conf)
-        weight_kalman_list.append(w_k)
-        weight_cumulative_list.append(w_c)
+        conf_list.append(conf)
+        w_k_list.append(w_k)
+        w_c_list.append(w_c)
 
     hi_fused_arr = np.array(hi_fused_list)
-    raw_confidences_arr = np.array(fusion_confidences_raw_list)
-    weight_kalman_arr = np.array(weight_kalman_list)
-    weight_cumulative_arr = np.array(weight_cumulative_list)
-
-    print("Applying Smoothing...")
-    window_len = 50
-
-    def apply_smoothing(raw_data, window):
-        if len(raw_data) <= len(window): return raw_data
-        s = np.r_[raw_data[len(window) - 1:0:-1], raw_data, raw_data[-1:-len(window):-1]]
-        y = np.convolve(window, s, mode='valid')
-        start_index = (len(y) - len(raw_data)) // 2
-        return y[start_index: start_index + len(raw_data)]
-
-    if len(raw_confidences_arr) > window_len:
-        w = np.hanning(window_len)
-        w = w / w.sum()
-        fusion_confidences_arr = apply_smoothing(raw_confidences_arr, w)
-        weight_kalman_arr = apply_smoothing(weight_kalman_arr, w)
-        weight_cumulative_arr = apply_smoothing(weight_cumulative_arr, w)
-    else:
-        fusion_confidences_arr = raw_confidences_arr
-
-    fusion_confidences_arr = np.clip(fusion_confidences_arr, 0.0, 1.0)
-    weight_kalman_arr = np.clip(weight_kalman_arr, 0.0, 1.0)
-    weight_cumulative_arr = np.clip(weight_cumulative_arr, 0.0, 1.0)
-
-    print("Applying Median Filtering to Fused HI...")
     hi_fused_filtered = medfilt(hi_fused_arr, kernel_size=211)
 
-    print("Generating Final Visualizations...")
-    visualize_final_fusion(final_hi_filtered, hi_cumulative_arr, hi_fused_arr, fusion_confidences_arr)
-    visualize_fusion_weights(weight_kalman_arr, weight_cumulative_arr)
+    # ==========================================================
+    # 【核心新增：保存 Origin 数据】
+    # ==========================================================
+    print(f"\nSaving data for Origin to: {final_output_dir}")
+
+    # 1. 保存聚类与特征数据 (RMS, PCA, Labels)
+    origin_cluster_df = df_cluster_feats.copy()
+    origin_cluster_df['Labels_Filtered'] = labels
+    origin_cluster_df['PCA_1'] = pca_data[:, 0]
+    origin_cluster_df['PCA_2'] = pca_data[:, 1]
+    origin_cluster_df.to_csv(os.path.join(final_output_dir, "Origin_Clustering_Data.csv"), index=False)
+
+    # 2. 保存 HI 与 融合数据
+    origin_hi_df = pd.DataFrame({
+        'Sample_Index': range(n_total_samples),
+        'Raw_HI': raw_hi_array,
+        'Stitched_HI': final_hi_stitched_array,
+        'Kalman_Filtered_HI': final_hi_filtered,
+        'Log_Likelihood': log_likelihood_array,
+        'Threshold': thresholds_array,
+        'Cumulative_HI': hi_cumulative_arr,
+        'Anomaly_Flag': anomaly_flags.astype(int),
+        'Fused_HI_Raw': hi_fused_arr,
+        'Fused_HI_Median_Filtered': hi_fused_filtered,
+        'Fusion_Confidence': conf_list,
+        'Weight_Kalman': w_k_list,
+        'Weight_Cumulative': w_c_list,
+        'Cluster_Label': labels
+    })
+    origin_hi_df.to_csv(os.path.join(final_output_dir, "Origin_HI_Fusion_Results.csv"), index=False)
+
+    print("Origin CSV files saved successfully.")
+    # ==========================================================
+
+    # 保持原有的所有可视化输出
+    visualize_original_hi_separate(final_hi_filtered)
+    visualize_hi_with_cluster_boundaries(final_hi_filtered, labels)
+    visualize_cumulative_hi_only(hi_cumulative_arr, anomaly_flags)
+    visualize_final_fusion(final_hi_filtered, hi_cumulative_arr, hi_fused_arr, np.array(conf_list))
+    visualize_fusion_weights(np.array(w_k_list), np.array(w_c_list))
     visualize_fused_hi_median_filtered(hi_fused_arr, hi_fused_filtered)
 
     print("Processing Complete.")
